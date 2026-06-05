@@ -1,7 +1,9 @@
 use crate::high_level_api::global_state;
 use crate::high_level_api::integers::FheIntegerType;
 use crate::high_level_api::keys::InternalServerKey;
-use crate::high_level_api::re_randomization::ReRandomizationMetadata;
+use crate::high_level_api::re_randomization::{
+    ReRandomizationHashAlgo, ReRandomizationMetadata, ReRandomizationMode,
+};
 use crate::integer::server_key::radix_parallel::bitonic_shuffle::BitonicShuffleKeySize;
 use crate::OprfSeed;
 
@@ -51,9 +53,49 @@ where
     })
 }
 
+pub fn re_randomized_keys_bitonic_shuffle<T, S>(
+    data: Vec<T>,
+    key_size: BitonicShuffleKeySize,
+    seed: S,
+    re_randomization_mode: ReRandomizationMode,
+    re_randomization_hash_algo: ReRandomizationHashAlgo,
+) -> Result<Vec<T>, crate::Error>
+where
+    T: FheIntegerType,
+    S: OprfSeed,
+{
+    global_state::with_internal_keys(|key| match key {
+        InternalServerKey::Cpu(cpu_key) => {
+            let re_randomization_key =
+                cpu_key.integer_re_randomization_key_from_mode(re_randomization_mode)?;
+            let inner = data.into_iter().map(|v| v.into_cpu()).collect();
+            let result = cpu_key.pbs_key().re_randomized_keys_bitonic_shuffle(
+                &cpu_key.oprf_key(),
+                inner,
+                key_size,
+                seed,
+                &re_randomization_key,
+                re_randomization_hash_algo,
+            )?;
+            Ok(result
+                .into_iter()
+                .map(|ct| T::from_cpu(ct, cpu_key.tag.clone(), ReRandomizationMetadata::default()))
+                .collect())
+        }
+        #[cfg(feature = "gpu")]
+        InternalServerKey::Cuda(_) => Err(crate::Error::new(
+            "bitonic_shuffle is not supported on Cuda".to_string(),
+        )),
+        #[cfg(feature = "hpu")]
+        InternalServerKey::Hpu(_) => Err(crate::Error::new(
+            "bitonic_shuffle is not supported on Hpu".to_string(),
+        )),
+    })
+}
+
 #[cfg(test)]
 mod test {
-    use super::{bitonic_shuffle, BitonicShuffleKeySize};
+    use super::*;
     use crate::core_crypto::prelude::new_seeder;
     use crate::high_level_api::prelude::*;
     use crate::high_level_api::tests::setup_default_cpu;
@@ -74,9 +116,19 @@ mod test {
         let seed = new_seeder().seed();
         println!("seed: {seed:?}");
         let shuffled =
-            bitonic_shuffle(encrypted, BitonicShuffleKeySize::num_bits(32), seed).unwrap();
+            bitonic_shuffle(encrypted.clone(), BitonicShuffleKeySize::num_bits(32), seed).unwrap();
+        let shuffled_rerand = re_randomized_keys_bitonic_shuffle(
+            encrypted,
+            BitonicShuffleKeySize::num_bits(32),
+            seed,
+        )
+        .unwrap();
 
         let mut decrypted: Vec<u8> = shuffled.iter().map(|ct| ct.decrypt(&cks)).collect();
+        let mut decrypted_rerand: Vec<u8> =
+            shuffled_rerand.iter().map(|ct| ct.decrypt(&cks)).collect();
+
+        assert_eq!(decrypted, decrypted_rerand);
 
         clear_values.sort_unstable();
         decrypted.sort_unstable();
